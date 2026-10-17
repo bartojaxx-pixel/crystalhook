@@ -1,0 +1,300 @@
+===========================================================
+= PLAYER.GD (CharacterBody3D)
+===========================================================
+extends CharacterBody3D
+
+@export var speed := 6.0
+@export var jump_force := 12.0
+@export var gravity := 24.0
+
+@export var max_stamina := 100.0
+@export var stamina_regen := 15.0
+@export var sprint_cost := 25.0
+
+@export var max_hook_energy := 100.0
+@export var hook_cost := 30.0
+@export var hook_regen := 10.0
+
+var stamina := 0.0
+var hook_energy := 0.0
+var is_sprinting := false
+
+var velocity := Vector3.ZERO
+var health := 100
+
+@onready var harpoon = $Harpoon
+
+var inventory := {
+    "crystal_shard": 0,
+    "metal_scrap": 0,
+    "bomb": 3,
+    "hook_core": 0
+}
+
+var recipes := {
+    "bomb": {
+        "crystal_shard": 2,
+        "metal_scrap": 1
+    },
+    "hook_core": {
+        "crystal_shard": 3
+    }
+}
+
+func _ready():
+    stamina = max_stamina
+    hook_energy = max_hook_energy
+    add_to_group("player")
+
+func _physics_process(delta):
+    var input_dir = Vector3.ZERO
+    input_dir.x = Input.get_action_strength("move_right") - Input.get_action_strength("move_left")
+    input_dir.z = Input.get_action_strength("move_backward") - Input.get_action_strength("move_forward")
+    input_dir = input_dir.normalized()
+
+    var direction = (transform.basis * input_dir).normalized()
+
+    is_sprinting = Input.is_action_pressed("sprint") and stamina > 0.0
+    var current_speed = speed
+
+    if is_sprinting:
+        current_speed *= 1.5
+        stamina = max(stamina - sprint_cost * delta, 0.0)
+    else:
+        stamina = min(stamina + stamina_regen * delta, max_stamina)
+
+    velocity.x = direction.x * current_speed
+    velocity.z = direction.z * current_speed
+
+    if not is_on_floor():
+        velocity.y -= gravity * delta
+    else:
+        if Input.is_action_just_pressed("jump"):
+            velocity.y = jump_force
+
+    hook_energy = min(hook_energy + hook_regen * delta, max_hook_energy)
+
+    move_and_slide()
+
+func _input(event):
+    if event.is_action_pressed("fire_grapple"):
+        harpoon.fire()
+
+    if event.is_action_pressed("throw_bomb"):
+        if inventory.get("bomb", 0) > 0:
+            throw_bomb()
+            inventory["bomb"] -= 1
+
+    if event.is_action_pressed("craft_bomb"):
+        craft("bomb")
+
+    if event.is_action_pressed("craft_hook_core"):
+        craft("hook_core")
+
+func throw_bomb():
+    var bomb = preload("res://scenes/Items/CrystalBomb.tscn").instantiate()
+    bomb.global_transform.origin = global_transform.origin + transform.basis.z * -1.5
+    get_tree().current_scene.add_child(bomb)
+
+func add_item(item_name: String, amount: int = 1):
+    if not inventory.has(item_name):
+        inventory[item_name] = 0
+    inventory[item_name] += amount
+
+func can_craft(item_name: String) -> bool:
+    if not recipes.has(item_name):
+        return false
+    for req in recipes[item_name].keys():
+        if inventory.get(req, 0) < recipes[item_name][req]:
+            return false
+    return true
+
+func craft(item_name: String) -> bool:
+    if not can_craft(item_name):
+        return false
+    for req in recipes[item_name].keys():
+        inventory[req] -= recipes[item_name][req]
+    add_item(item_name, 1)
+    return true
+
+func take_damage(amount: int):
+    health -= amount
+    if health <= 0:
+        die()
+
+func die():
+    get_tree().reload_current_scene()
+
+
+===========================================================
+= HARPOON.GD (Node3D)
+===========================================================
+extends Node3D
+
+@export var max_distance := 40.0
+@export var pull_speed := 12.0
+
+var is_grappling := false
+var target_point := Vector3.ZERO
+var player := null
+
+func _ready():
+    player = get_parent()
+
+func fire():
+    if not player:
+        return
+
+    if player.hook_energy < player.hook_cost:
+        return
+
+    var ray = $RayCast3D
+    ray.force_raycast_update()
+
+    if ray.is_colliding():
+        var collider = ray.get_collider()
+        if collider is GrapplePoint:
+            target_point = ray.get_collision_point()
+            is_grappling = true
+            player.hook_energy -= player.hook_cost
+
+func _physics_process(delta):
+    if is_grappling:
+        var dir = (target_point - player.global_transform.origin)
+        var dist = dir.length()
+
+        if dist < 1.5:
+            is_grappling = false
+            return
+
+        player.velocity = dir.normalized() * pull_speed
+
+
+===========================================================
+= GRAPPLEPOINT.GD (Area3D)
+===========================================================
+extends Area3D
+class_name GrapplePoint
+
+
+===========================================================
+= CRYSTALBOMB.GD (RigidBody3D)
+===========================================================
+extends RigidBody3D
+
+@export var fuse_time := 2.0
+@export var blast_radius := 6.0
+@export var blast_force := 20.0
+
+func _ready():
+    await get_tree().create_timer(fuse_time).timeout
+    explode()
+
+func explode():
+    var space_state = get_world_3d().direct_space_state
+    var query = PhysicsShapeQueryParameters3D.new()
+    query.transform = global_transform
+    query.shape = CollisionShape3D.new().shape
+    var bodies = space_state.intersect_shape(query)
+
+    for b in bodies:
+        if b.collider is CharacterBody3D:
+            var push = (b.collider.global_transform.origin - global_transform.origin).normalized()
+            b.collider.velocity += push * blast_force
+
+    queue_free()
+
+
+===========================================================
+= CRYSTALSHARD.GD (Area3D)
+===========================================================
+extends Area3D
+
+func _ready():
+    body_entered.connect(_on_body_entered)
+
+func _on_body_entered(body):
+    if body.is_in_group("player"):
+        if body.has_method("add_item"):
+            body.add_item("crystal_shard", 1)
+        queue_free()
+
+
+===========================================================
+= CAVECRAWLER.GD (CharacterBody3D)
+===========================================================
+extends CharacterBody3D
+
+@export var move_speed := 3.0
+@export var detection_radius := 12.0
+@export var damage := 10
+
+var player: CharacterBody3D
+
+func _ready():
+    player = get_tree().get_first_node_in_group("player")
+
+func _physics_process(delta):
+    if not player:
+        return
+
+    var to_player = player.global_transform.origin - global_transform.origin
+    if to_player.length() > detection_radius:
+        return
+
+    var dir = to_player.normalized()
+    velocity = dir * move_speed
+    move_and_slide()
+
+    if to_player.length() < 1.5:
+        if player.has_method("take_damage"):
+            player.take_damage(damage)
+
+
+===========================================================
+= CRYSTALGOLEM.GD (CharacterBody3D)
+===========================================================
+extends CharacterBody3D
+
+@export var move_speed := 1.5
+@export var detection_radius := 18.0
+@export var damage := 20
+@export var crystal_drop_scene: PackedScene
+
+var player: CharacterBody3D
+var health := 100
+
+func _ready():
+    player = get_tree().get_first_node_in_group("player")
+
+func _physics_process(delta):
+    if not player:
+        return
+
+    var to_player = player.global_transform.origin - global_transform.origin
+    if to_player.length() > detection_radius:
+        return
+
+    var dir = to_player.normalized()
+    velocity = dir * move_speed
+    move_and_slide()
+
+    if to_player.length() < 2.0:
+        if player.has_method("take_damage"):
+            player.take_damage(damage)
+
+func take_damage(amount: int):
+    health -= amount
+    if health <= 0:
+        die()
+
+func die():
+    if crystal_drop_scene:
+        var drop = crystal_drop_scene.instantiate()
+        drop.global_transform.origin = global_transform.origin
+        get_tree().current_scene.add_child(drop)
+    queue_free()
+
+===========================================================
+= END OF FILE
+===========================================================
